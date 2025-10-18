@@ -1,0 +1,246 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Warehouse lines lookup — POC</title>
+  <style>
+    body { font-family: system-ui, Arial; max-width: 900px; margin: 24px auto; padding: 0 16px; color: #111; }
+    h1 { margin-bottom: 8px; }
+    .card { border: 1px solid #ddd; padding: 12px; border-radius: 8px; margin-bottom: 12px; background: #fafafa; }
+    .row { display:flex; gap:8px; align-items:center; }
+    input[type="text"] { flex:1; padding:8px; font-size:14px; }
+    button { padding:8px 12px; font-size:14px; cursor:pointer; }
+    table { width:100%; border-collapse: collapse; margin-top:12px; }
+    th, td { border:1px solid #e6e6e6; padding:8px; text-align:left; }
+    .muted { color:#666; font-size:13px; }
+    .small { font-size:13px; padding:6px 8px; }
+    #status { margin-top:8px; color:#0a58ca; }
+  </style>
+  <!-- Dexie (IndexedDB) -->
+  <script src="https://unpkg.com/dexie@3.2.4/dist/dexie.min.js"></script>
+  <!-- SheetJS -->
+  <script src="https://cdn.sheetjs.com/xlsx-latest/package/dist/xlsx.full.min.js"></script>
+</head>
+<body>
+  <h1>Warehouse lines lookup — POC</h1>
+  <div class="card" id="import-card">
+    <strong>Step 1 — Import Excel file</strong>
+    <p class="muted">Expected: store number in column D, line number in column F. Store rows start at row 8. Re-upload will replace existing data.</p>
+    <input id="file-input" type="file" accept=".xlsx,.xls" />
+    <div style="margin-top:8px;">
+      <button id="import-btn" class="small">Import selected file</button>
+      <button id="reupload-btn" class="small">Re-upload (replace DB)</button>
+      <button id="clear-btn" class="small">Clear DB</button>
+    </div>
+    <div id="status" aria-live="polite"></div>
+  </div>
+<div class="card" id="search-card" style="display:none;">
+    <strong>Step 2 — Search stores</strong>
+    <p class="muted">Enter one or more store numbers separated by commas (e.g. 12, 34,56). Results sorted by line number descending.</p>
+    <div class="row" style="margin-top:8px;">
+      <input id="stores-input" type="text" placeholder="Enter store numbers (comma separated)"/>
+      <button id="search-btn">Search</button>
+    </div>
+    <div id="result-info" class="muted" style="margin-top:8px"></div>
+    <div id="results"></div>
+  </div>
+<script>
+/*
+ POC behavior:
+ - Read Excel file (.xlsx/.xls)
+ - Start reading rows from Excel row index 8 (1-based) -> zero-based index 7
+ - Column D -> index 3 for store number
+ - Column F -> index 5 for line number
+ - Save items to Dexie DB: { id, storeNumber: string, lineNumber: number }
+ - Re-upload replaces DB contents
+ - Search by comma-separated store numbers, show results sorted by lineNumber descending
+*/
+
+const START_ROW_INDEX_0BASED = 7; // row 8 in Excel (0-based)
+const COL_STORE_INDEX = 3; // column D
+const COL_LINE_INDEX = 5;  // column F
+
+// Dexie DB
+const db = new Dexie('warehousePocDb');
+db.version(1).stores({
+  lines: '++id,storeNumber,lineNumber'
+});
+
+const fileInput = document.getElementById('file-input');
+const importBtn = document.getElementById('import-btn');
+const reuploadBtn = document.getElementById('reupload-btn');
+const clearBtn = document.getElementById('clear-btn');
+const statusEl = document.getElementById('status');
+const searchCard = document.getElementById('search-card');
+const importCard = document.getElementById('import-card');
+const searchBtn = document.getElementById('search-btn');
+const storesInput = document.getElementById('stores-input');
+const resultsEl = document.getElementById('results');
+const resultInfo = document.getElementById('result-info');
+
+async function init() {
+  const count = await db.lines.count();
+  if (count > 0) {
+    showSearch();
+    status('Loaded ' + count + ' rows from local DB.');
+  } else {
+    showImport();
+    status('No local data. Please import an Excel file.');
+  }
+}
+
+function showSearch() {
+  importCard.style.display = 'none';
+  searchCard.style.display = 'block';
+}
+
+function showImport() {
+  importCard.style.display = 'block';
+  searchCard.style.display = 'none';
+}
+
+function status(msg) {
+  statusEl.textContent = msg;
+}
+
+// Import file
+importBtn.addEventListener('click', async () => {
+  const f = fileInput.files[0];
+  if (!f) { alert('Please select an Excel file first.'); return; }
+  await importFile(f, { replace: false });
+});
+
+// Clear DB
+clearBtn.addEventListener('click', async () => {
+  if (!confirm('Clear local database?')) return;
+  await db.lines.clear();
+  resultsEl.innerHTML = ''; // Clear previous results
+  resultInfo.textContent = '';
+  showImport();
+  status('Database cleared. Please import a file.');
+});
+
+// Reupload (replace DB)
+reuploadBtn.addEventListener('click', async () => {
+  const f = fileInput.files[0];
+  if (!f) { alert('Please select an Excel file first.'); return; }
+  if (!confirm('Re-upload will replace the existing local database. Continue?')) return;
+  await importFile(f, { replace: true });
+});
+
+async function importFile(file, opts = { replace: true }) {
+  try {
+    status('Reading file...');
+    const arrayBuffer = await file.arrayBuffer();
+    const workbook = XLSX.read(arrayBuffer, { type: 'array' });
+    const firstSheetName = workbook.SheetNames[0];
+    if (!firstSheetName) { status('No sheets found in file.'); return; }
+    const sheet = workbook.Sheets[firstSheetName];
+    // Get rows as arrays (header:1) to access by column index
+    const rows = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: '' });
+    if (!Array.isArray(rows) || rows.length === 0) {
+      status('No rows read from sheet.');
+      return;
+    }
+    // Collect items
+    const items = [];
+    for (let i = START_ROW_INDEX_0BASED; i < rows.length; i++) {
+      const r = rows[i];
+      if (!Array.isArray(r)) continue;
+      const rawStore = r[COL_STORE_INDEX];
+      const rawLine = r[COL_LINE_INDEX];
+      if (rawStore == null || rawStore === '') continue;
+      // store number as trimmed string
+      const storeNumber = String(rawStore).trim();
+      // try parse number for sorting; if not numeric, keep as NaN and skip or keep as 0 based on needs
+      const parsedLine = Number(String(rawLine).trim());
+      if (String(rawLine).trim() === '') continue; // skip empty line numbers
+      if (isNaN(parsedLine)) {
+        // If line number is not numeric, try to extract digits; else skip
+        const digits = (String(rawLine).match(/-?\d+/) || [])[0];
+        if (digits) {
+          items.push({ storeNumber, lineNumber: Number(digits) });
+        } else {
+          // skip non-numeric line entries
+          continue;
+        }
+      } else {
+        items.push({ storeNumber, lineNumber: parsedLine });
+      }
+      if (items.length >= 1000) break; // safety (your size is <=100)
+    }
+
+    if (opts.replace) {
+      status('Replacing DB and importing ' + items.length + ' rows...');
+      await db.transaction('rw', db.lines, async () => {
+        await db.lines.clear();
+        if (items.length > 0) await db.lines.bulkAdd(items);
+      });
+    } else {
+      status('Appending ' + items.length + ' rows to DB...');
+      await db.lines.bulkAdd(items);
+    }
+
+    const count = await db.lines.count();
+    status('Import complete. Local DB rows: ' + count);
+    showSearch();
+  } catch (err) {
+    console.error(err);
+    status('Error during import: ' + (err && err.message ? err.message : String(err)));
+  }
+}
+
+// Search
+searchBtn.addEventListener('click', async () => {
+  const raw = storesInput.value || '';
+  const stores = raw.split(',').map(s => s.trim()).filter(Boolean);
+  if (stores.length === 0) { alert('Enter at least one store number.'); return; }
+  status('Searching for ' + stores.join(', '));
+  // Query Dexie: anyOf on storeNumber field
+  try {
+    // If many stores, ensure we pass array of strings
+    const normalized = stores.map(s => String(s));
+    const rows = await db.lines.where('storeNumber').anyOf(normalized).toArray();
+    // Sort descending by lineNumber
+    rows.sort((a,b) => (b.lineNumber || 0) - (a.lineNumber || 0));
+    renderResults(rows);
+    resultInfo.textContent = `Found ${rows.length} matching lines for [${normalized.join(', ')}].`;
+    status('Search complete.');
+  } catch (err) {
+    console.error(err);
+    status('Error during search: ' + (err && err.message ? err.message : String(err)));
+  }
+});
+
+function renderResults(rows) {
+  if (!rows || rows.length === 0) {
+    resultsEl.innerHTML = '<p class="muted">No results.</p>';
+    return;
+  }
+  const tbl = document.createElement('table');
+  const thead = document.createElement('thead');
+  thead.innerHTML = '<tr><th>Store number</th><th>Line number</th></tr>';
+  tbl.appendChild(thead);
+  const tb = document.createElement('tbody');
+  for (const r of rows) {
+    const tr = document.createElement('tr');
+    const td1 = document.createElement('td');
+    td1.textContent = r.storeNumber;
+    const td2 = document.createElement('td');
+    td2.textContent = r.lineNumber;
+    tr.appendChild(td1);
+    tr.appendChild(td2);
+    tb.appendChild(tr);
+  }
+  tbl.appendChild(tb);
+  resultsEl.innerHTML = '';
+  resultsEl.appendChild(tbl);
+}
+
+// Initialize
+init();
+
+</script>
+</body>
+</html>
